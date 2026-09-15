@@ -1,0 +1,71 @@
+import streamlit as st
+import ccxt
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="My AlgoBacktest Studio", layout="wide")
+st.title("📊 My Custom Algorithmic Backtesting Studio")
+
+st.sidebar.header("⚙️ १. मार्केट निवडा")
+asset_type = st.sidebar.selectbox("Asset Type", ["Crypto (Binance)", "Stocks / Indices (Yahoo Finance)"])
+
+if asset_type == "Crypto (Binance)":
+    symbol = st.sidebar.text_input("Currency Pair", "BTC/USDT")
+    timeframe = st.sidebar.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3)
+else:
+    symbol = st.sidebar.text_input("Ticker Symbol", "RELIANCE.NS")
+    timeframe = st.sidebar.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "1d"], index=4)
+
+limit = st.sidebar.slider("कँडल्सची संख्या", 100, 2000, 500)
+fast_ma = st.sidebar.number_input("Fast MA", min_value=1, value=10)
+slow_ma = st.sidebar.number_input("Slow MA", min_value=2, value=30)
+initial_capital = st.sidebar.number_input("प्रारंभिक भांडवल ($)", value=10000)
+
+@st.cache_data(ttl=300)
+def load_data(asset_type, symbol, timeframe, limit):
+    try:
+        if asset_type == "Crypto (Binance)":
+            exchange = ccxt.binance()
+            bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df
+        else:
+            tf_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "60m", "1d": "1d"}
+            period_map = {"1m": "7d", "5m": "1mo", "15m": "1mo", "1h": "2mo", "1d": "2y"}
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period_map[timeframe], interval=tf_map[timeframe])
+            df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+            return df
+    except Exception as e:
+        st.error(f"डेटा एरर: {e}")
+        return None
+
+if st.button("🚀 Run Backtest Now"):
+    with st.spinner("डेटा लोड होत आहे..."):
+        df = load_data(asset_type, symbol, timeframe, limit)
+
+        if df is not None and not df.empty:
+            df['SMA_Fast'] = df['close'].rolling(window=fast_ma).mean()
+            df['SMA_Slow'] = df['close'].rolling(window=slow_ma).mean()
+            df['Signal'] = np.where(df['SMA_Fast'] > df['SMA_Slow'], 1, 0)
+            df['Position'] = df['Signal'].shift(1)
+            df['Market_Returns'] = df['close'].pct_change()
+            df['Strategy_Returns'] = df['Market_Returns'] * df['Position']
+            df['Portfolio_Value'] = initial_capital * (1 + df['Strategy_Returns']).cumprod()
+
+            total_return = ((df['Portfolio_Value'].iloc[-1] - initial_capital) / initial_capital) * 100
+            market_return = ((df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0]) * 100
+
+            col1, col2 = st.columns(2)
+            col1.metric("अंतिम व्हॅल्यू", f"${df['Portfolio_Value'].iloc[-1]:,.2f}")
+            col2.metric("स्ट्रॅटेजी रिटर्न", f"{total_return:.2f}%")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df.index, y=df['close'], name="Price"))
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA_Fast'], name=f"SMA {fast_ma}"))
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA_Slow'], name=f"SMA {slow_ma}"))
+            st.plotly_chart(fig, use_container_width=True)
