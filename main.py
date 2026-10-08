@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import ccxt
@@ -158,16 +159,31 @@ def get_symbols():
         return _symbol_cache
 
     symbols_by_ticker = {item["symbol"]: item.copy() for item in MARKET_CATALOG}
-    for exchange, fetch_symbols in (
-        ("NSE", _fetch_nse_symbols),
-        ("BSE", _fetch_bse_symbols),
-    ):
-        try:
-            symbols_by_ticker.update(
-                (item["symbol"], item) for item in fetch_symbols()
-            )
-        except (HTTPError, URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            logging.warning("Could not refresh %s symbol list: %s", exchange, error)
+    fetchers = {
+        "NSE": _fetch_nse_symbols,
+        "BSE": _fetch_bse_symbols,
+    }
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
+        futures = {
+            executor.submit(fetch_symbols): exchange
+            for exchange, fetch_symbols in fetchers.items()
+        }
+        for future in as_completed(futures):
+            exchange = futures[future]
+            try:
+                symbols_by_ticker.update(
+                    (item["symbol"], item) for item in future.result()
+                )
+            except (
+                HTTPError,
+                URLError,
+                TimeoutError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ) as error:
+                logging.warning(
+                    "Could not refresh %s symbol list: %s", exchange, error
+                )
 
     _symbol_cache = list(symbols_by_ticker.values())
     _symbol_cache_time = now
