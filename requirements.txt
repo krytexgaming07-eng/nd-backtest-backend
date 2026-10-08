@@ -1,7 +1,8 @@
 fastapi
 uvicorn
+ccxt
+yfinance
 pandas
 numpy
-yfinance
-ccxt
 ta
+firebase-admin

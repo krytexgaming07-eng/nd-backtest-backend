@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -7,8 +7,10 @@ import csv
 import io
 import json
 import logging
+import os
 import time
 import calendar
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -17,9 +19,15 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import ta
+import firebase_admin
+from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
+from firebase_admin import firestore as firebase_firestore
 
 app = FastAPI()
 BACKTEST_ENGINE_VERSION = "risk-costs-v2"
+MAX_ASYNC_TRADE_LOGS = 10000
+FIRESTORE_TRADE_LOGS_PER_DOCUMENT = 200
+_firestore_client = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -370,8 +378,221 @@ def health():
     return {"status": "ok", "engine_version": BACKTEST_ENGINE_VERSION}
 
 
+def _get_firestore_client():
+    global _firestore_client
+    if _firestore_client is not None:
+        return _firestore_client
+    service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if not service_account_json:
+        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON is not configured.")
+    try:
+        firebase_app = firebase_admin.get_app()
+    except ValueError:
+        service_account = json.loads(service_account_json)
+        firebase_app = firebase_admin.initialize_app(
+            firebase_credentials.Certificate(service_account)
+        )
+    _firestore_client = firebase_firestore.client(firebase_app)
+    return _firestore_client
+
+
+def _authenticated_uid(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Firebase sign-in is required.")
+    try:
+        decoded_token = firebase_auth.verify_id_token(authorization[7:])
+    except Exception as error:
+        raise HTTPException(status_code=401, detail="Invalid or expired sign-in token.") from error
+    uid = decoded_token.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="The sign-in token has no user ID.")
+    return uid
+
+
+def _dispatch_long_backtest(job_id: str) -> None:
+    token = os.environ.get("GITHUB_ACTIONS_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_ACTIONS_TOKEN is not configured.")
+    owner = os.environ.get("GITHUB_ACTIONS_OWNER", "krytexgaming07-eng")
+    repository = os.environ.get("GITHUB_ACTIONS_REPOSITORY", "nd-backtest-backend")
+    request = Request(
+        f"https://api.github.com/repos/{owner}/{repository}/dispatches",
+        data=json.dumps({
+            "event_type": "run-long-backtest",
+            "client_payload": {"job_id": job_id},
+        }).encode("utf-8"),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "nd-backtest",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=15) as response:
+        if response.status != 204:
+            raise RuntimeError(f"GitHub Actions dispatch returned HTTP {response.status}.")
+
+
+@app.post("/backtest-jobs")
+def create_backtest_job(
+    req: AdvancedBacktestRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    uid = _authenticated_uid(authorization)
+    if req.mode != "indicator":
+        raise HTTPException(
+            status_code=400,
+            detail="Long Binance archive jobs support indicator mode only; custom code is disabled.",
+        )
+    if req.data_source != "binance_archive" or req.exchange.lower() != "binance":
+        raise HTTPException(
+            status_code=400,
+            detail="Long jobs require the explicitly selected Binance Spot archive source.",
+        )
+    if req.symbol.upper().replace("/", "") != "BTCUSDT":
+        raise HTTPException(
+            status_code=400,
+            detail="The free historical archive worker currently supports BTC/USDT only.",
+        )
+    if req.timeframe != "1m":
+        raise HTTPException(
+            status_code=400,
+            detail="The long Binance archive worker currently accepts 1-minute backtests only.",
+        )
+    if req.timeframe not in TIMEFRAME_SETTINGS:
+        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {req.timeframe}.")
+
+    end_date = req.end_date or date.today()
+    start_date = req.start_date or end_date - timedelta(days=30)
+    if end_date > date.today():
+        raise HTTPException(status_code=400, detail="Backtest end date cannot be in the future.")
+    date_range_error = _validate_backtest_date_range(start_date, end_date)
+    if start_date > end_date or date_range_error:
+        raise HTTPException(
+            status_code=400,
+            detail=date_range_error or "Start date must be on or before end date.",
+        )
+
+    job_id = uuid.uuid4().hex
+    firestore = _get_firestore_client()
+    job_reference = firestore.collection("backtest_jobs").document(job_id)
+    active_reference = firestore.collection("active_backtest_jobs").document(uid)
+    active_snapshot = active_reference.get()
+    active_job_id = (active_snapshot.to_dict() or {}).get("job_id") if active_snapshot.exists else None
+    if active_job_id:
+        active_job = firestore.collection("backtest_jobs").document(active_job_id).get()
+        if active_job.exists and (active_job.to_dict() or {}).get("status") in {
+            "queued", "downloading", "calculating",
+        }:
+            raise HTTPException(
+                status_code=429,
+                detail="You already have a long backtest running. Wait for it to finish.",
+            )
+    job_reference.set({
+        "uid": uid,
+        "status": "queued",
+        "progress_pct": 0,
+        "message": "Queued for free GitHub Actions processing.",
+        "request": req.dict(),
+        "created_at": firebase_firestore.SERVER_TIMESTAMP,
+        "updated_at": firebase_firestore.SERVER_TIMESTAMP,
+    })
+    active_reference.set({"job_id": job_id, "status": "queued"})
+    try:
+        _dispatch_long_backtest(job_id)
+    except Exception as error:
+        job_reference.update({
+            "status": "failed",
+            "message": f"Could not start the worker: {error}",
+            "updated_at": firebase_firestore.SERVER_TIMESTAMP,
+        })
+        active_reference.set({"job_id": job_id, "status": "failed"})
+        raise HTTPException(
+            status_code=503,
+            detail="Could not start the free backtest worker. Check GitHub Actions configuration.",
+        ) from error
+    return {"status": "queued", "job_id": job_id}
+
+
+@app.get("/backtest-jobs/{job_id}")
+def get_backtest_job(
+    job_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    uid = _authenticated_uid(authorization)
+    snapshot = _get_firestore_client().collection("backtest_jobs").document(job_id).get()
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="Backtest job was not found.")
+    job = snapshot.to_dict() or {}
+    if job.get("uid") != uid:
+        raise HTTPException(status_code=403, detail="This backtest job belongs to another user.")
+    response = {
+        "status": job.get("status"),
+        "progress_pct": job.get("progress_pct", 0),
+        "message": job.get("message", ""),
+    }
+    if job.get("status") == "completed":
+        response["result"] = job.get("result", {})
+        response["trade_log_count"] = job.get("trade_log_count", 0)
+        response["trade_logs_truncated"] = job.get("trade_logs_truncated", False)
+    return response
+
+
+@app.get("/backtest-jobs/{job_id}/trades")
+def get_backtest_job_trades(
+    job_id: str,
+    offset: int = 0,
+    limit: int = 200,
+    authorization: Optional[str] = Header(default=None),
+):
+    uid = _authenticated_uid(authorization)
+    if offset < 0 or limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="Use offset >= 0 and limit between 1 and 500.")
+    job_reference = _get_firestore_client().collection("backtest_jobs").document(job_id)
+    snapshot = job_reference.get()
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="Backtest job was not found.")
+    job = snapshot.to_dict() or {}
+    if job.get("uid") != uid:
+        raise HTTPException(status_code=403, detail="This backtest job belongs to another user.")
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="The backtest is not complete.")
+
+    first_chunk = offset // FIRESTORE_TRADE_LOGS_PER_DOCUMENT
+    last_chunk = (offset + limit - 1) // FIRESTORE_TRADE_LOGS_PER_DOCUMENT
+    trades = []
+    for chunk_index in range(first_chunk, last_chunk + 1):
+        chunk = (
+            job_reference.collection("trades")
+            .document(f"{chunk_index:06d}")
+            .get()
+        )
+        if chunk.exists:
+            trades.extend((chunk.to_dict() or {}).get("items", []))
+    start_in_page = offset % FIRESTORE_TRADE_LOGS_PER_DOCUMENT
+    trades = trades[start_in_page : start_in_page + limit]
+    total = int(job.get("trade_log_count", 0))
+    return {
+        "trades": trades,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "has_more": offset + len(trades) < total,
+    }
+
+
 @app.post("/run-backtest")
 def run_backtest(req: AdvancedBacktestRequest):
+    return _run_backtest(req)
+
+
+def _run_backtest(
+    req: AdvancedBacktestRequest,
+    data_override: Optional[pd.DataFrame] = None,
+    allow_large_dataset: bool = False,
+):
     try:
         if req.timeframe not in TIMEFRAME_SETTINGS:
             return {"status": "error", "message": f"Unsupported timeframe: {req.timeframe}."}
@@ -399,7 +620,7 @@ def run_backtest(req: AdvancedBacktestRequest):
         date_range_error = _validate_backtest_date_range(start_date, end_date)
         if date_range_error:
             return {"status": "error", "message": date_range_error}
-        if req.data_source != "ccxt":
+        if req.data_source != "ccxt" and data_override is None:
             source_interval = YFINANCE_INTERVALS[req.timeframe]
             max_history_days = {"1m": 7, "5m": 60, "15m": 60, "30m": 60, "60m": 730}.get(
                 source_interval
@@ -415,7 +636,9 @@ def run_backtest(req: AdvancedBacktestRequest):
                 }
 
         # Fetch only candles inside the requested, inclusive date range.
-        if req.data_source == "ccxt":
+        if data_override is not None:
+            df = data_override.copy()
+        elif req.data_source == "ccxt":
             df = _fetch_ccxt_history(req, start_date, end_date)
         else:
             df = _fetch_yfinance_history(req, start_date, end_date)
@@ -424,7 +647,7 @@ def run_backtest(req: AdvancedBacktestRequest):
                 "status": "error",
                 "message": f"No {req.timeframe} data for {req.symbol} from {start_date} to {end_date}.",
             }
-        df["datetime"] = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d %H:%M")
+        df["datetime"] = pd.to_datetime(df["datetime"])
 
         df['signal'] = 0 # 1: Buy, -1: Sell, 0: Neutral
 
@@ -454,6 +677,12 @@ def run_backtest(req: AdvancedBacktestRequest):
         # Lookahead Bias टाळण्यासाठी: सिग्नल एका कँडलने पुढे शिफ्ट करणे
         # (म्हणजे आजचा सिग्नल पुढच्या कँडलच्या ओपनवर एक्झिक्युट होईल)
         df['exec_signal'] = df['signal'].shift(1).fillna(0)
+        open_values = df["open"].to_numpy()
+        high_values = df["high"].to_numpy()
+        low_values = df["low"].to_numpy()
+        close_values = df["close"].to_numpy()
+        time_values = df["datetime"].to_numpy()
+        signal_values = df["exec_signal"].to_numpy()
 
         # ३. व्हेक्टरायझेशन आणि सिमुलेशन (ट्रेड लॉग आणि इक्विटी कर्व्ह)
         capital = req.capital
@@ -462,7 +691,9 @@ def run_backtest(req: AdvancedBacktestRequest):
         max_drawdown = 0.0
 
         equity_curve = []
+        equity_stride = max(1, len(df) // 50)
         trade_logs = []
+        trade_logs_truncated = False
         
         in_trade = False
         entry_price = 0.0
@@ -486,11 +717,10 @@ def run_backtest(req: AdvancedBacktestRequest):
         total_india_charges = 0.0
 
         for i in range(len(df)):
-            row = df.iloc[i]
-            curr_open = row['open']
-            curr_time = row['datetime']
-            curr_close = row['close']
-            sig = row['exec_signal']
+            curr_open = open_values[i]
+            curr_time = time_values[i]
+            curr_close = close_values[i]
+            sig = signal_values[i]
 
             # Entry
             if (
@@ -512,8 +742,8 @@ def run_backtest(req: AdvancedBacktestRequest):
             elif in_trade:
                 exit_price = None
                 exit_reason = None
-                hit_stop = curr_open <= stop_price or row["low"] <= stop_price
-                hit_target = curr_open >= target_price or row["high"] >= target_price
+                hit_stop = curr_open <= stop_price or low_values[i] <= stop_price
+                hit_target = curr_open >= target_price or high_values[i] >= target_price
                 if hit_stop and hit_target:
                     ambiguous_exit_bars += 1
                 if hit_stop:
@@ -567,25 +797,31 @@ def run_backtest(req: AdvancedBacktestRequest):
                     elif exit_reason == "end_of_data":
                         end_of_data_exits += 1
 
-                    trade_logs.append({
-                        "entry_time": entry_time,
-                        "exit_time": curr_time,
-                        "entry_price": round(entry_price, 2),
-                        "exit_price": round(exit_price, 2),
-                        "stop_price": round(stop_price, 2),
-                        "target_price": round(target_price, 2),
-                        "risk_amount": risk_per_trade,
-                        "reward_amount": reward_per_trade,
-                        "gross_pnl": gross_pnl,
-                        "brokerage": brokerage,
-                        "slippage": slippage,
-                        "india_charges": india_charges,
-                        "total_charges": charges,
-                        "pnl": pnl,
-                        "return_pct": round(trade_pct * 100, 2),
-                        "exit_reason": exit_reason,
-                        "type": "BUY"
-                    })
+                    if (
+                        not allow_large_dataset
+                        or len(trade_logs) < MAX_ASYNC_TRADE_LOGS
+                    ):
+                        trade_logs.append({
+                            "entry_time": pd.Timestamp(entry_time).strftime("%Y-%m-%d %H:%M"),
+                            "exit_time": pd.Timestamp(curr_time).strftime("%Y-%m-%d %H:%M"),
+                            "entry_price": round(entry_price, 2),
+                            "exit_price": round(exit_price, 2),
+                            "stop_price": round(stop_price, 2),
+                            "target_price": round(target_price, 2),
+                            "risk_amount": risk_per_trade,
+                            "reward_amount": reward_per_trade,
+                            "gross_pnl": gross_pnl,
+                            "brokerage": brokerage,
+                            "slippage": slippage,
+                            "india_charges": india_charges,
+                            "total_charges": charges,
+                            "pnl": pnl,
+                            "return_pct": round(trade_pct * 100, 2),
+                            "exit_reason": exit_reason,
+                            "type": "BUY"
+                        })
+                    else:
+                        trade_logs_truncated = True
                     in_trade = False
 
             # Drawdown & Equity Tracking
@@ -595,10 +831,11 @@ def run_backtest(req: AdvancedBacktestRequest):
             if dd > max_drawdown:
                 max_drawdown = dd
 
-            equity_curve.append({
-                "time": curr_time,
-                "equity": round(capital, 2)
-            })
+            if i % equity_stride == 0 or i == len(df) - 1:
+                equity_curve.append({
+                    "time": pd.Timestamp(curr_time).strftime("%Y-%m-%d %H:%M"),
+                    "equity": round(capital, 2)
+                })
 
         total_trades = wins + losses + breakeven
         win_rate = round((wins / total_trades) * 100, 2) if total_trades > 0 else 0.0
@@ -638,8 +875,9 @@ def run_backtest(req: AdvancedBacktestRequest):
             "end_of_data_exits": end_of_data_exits,
             "ambiguous_exit_bars": ambiguous_exit_bars,
             "max_drawdown_pct": round(max_drawdown, 2),
-            "equity_curve": equity_curve[::max(1, len(equity_curve)//50)], # चार्टसाठी 50 पॉईंट्स
-            "trade_logs": trade_logs
+            "equity_curve": equity_curve,
+            "trade_logs": trade_logs,
+            "trade_logs_truncated": trade_logs_truncated,
         }
 
     except Exception as e:
