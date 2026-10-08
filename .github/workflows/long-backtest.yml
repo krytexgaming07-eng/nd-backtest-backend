@@ -1,0 +1,33 @@
+name: Long Binance Backtest
+
+on:
+  repository_dispatch:
+    types: [run-long-backtest]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: long-binance-backtests
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out backend
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Run authenticated backtest job
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: python backtest_worker.py "${{ github.event.client_payload.job_id }}"
