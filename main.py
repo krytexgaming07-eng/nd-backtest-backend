@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import time
+import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -228,6 +229,23 @@ YFINANCE_INTERVALS = {
 }
 
 MAX_BACKTEST_CANDLES = 20000
+MAX_BACKTEST_YEARS = 20
+
+
+def _earliest_supported_start_date(end_date: date) -> date:
+    year = end_date.year - MAX_BACKTEST_YEARS
+    day = min(end_date.day, calendar.monthrange(year, end_date.month)[1])
+    return date(year, end_date.month, day)
+
+
+def _validate_backtest_date_range(start_date: date, end_date: date) -> Optional[str]:
+    earliest_start_date = _earliest_supported_start_date(end_date)
+    if start_date < earliest_start_date:
+        return (
+            f"Backtests are limited to the most recent {MAX_BACKTEST_YEARS} years "
+            f"for the selected end date (earliest start: {earliest_start_date})."
+        )
+    return None
 
 
 def _filter_date_range(df: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
@@ -270,6 +288,12 @@ def _fetch_ccxt_history(req: "AdvancedBacktestRequest", start_date: date, end_da
         candles.extend(new_candles)
         if len(candles) > MAX_BACKTEST_CANDLES:
             raise ValueError(
+                f"This {req.timeframe} backtest requires more than "
+                f"{MAX_BACKTEST_CANDLES:,} candles, above the server's safe limit. "
+                "Keep the selected timeframe unchanged and choose a shorter date range."
+            )
+        if len(candles) > MAX_BACKTEST_CANDLES:
+            raise ValueError(
                 f"Selected date range exceeds {MAX_BACKTEST_CANDLES:,} candles for {req.timeframe}. "
                 "Choose a shorter range or a larger timeframe."
             )
@@ -305,6 +329,12 @@ def _fetch_yfinance_history(req: "AdvancedBacktestRequest", start_date: date, en
     required_columns = ["open", "high", "low", "close", "volume", "datetime"]
     df = df[required_columns]
     df = _filter_date_range(df, start_date, end_date)
+    if len(df) > MAX_BACKTEST_CANDLES:
+        raise ValueError(
+            f"This {req.timeframe} backtest requires more than "
+            f"{MAX_BACKTEST_CANDLES:,} candles, above the server's safe limit. "
+            "Keep the selected timeframe unchanged and choose a shorter date range."
+        )
     if len(df) > MAX_BACKTEST_CANDLES:
         raise ValueError(
             f"Selected date range exceeds {MAX_BACKTEST_CANDLES:,} candles for {req.timeframe}. "
@@ -366,6 +396,9 @@ def run_backtest(req: AdvancedBacktestRequest):
         )
         if start_date > end_date:
             return {"status": "error", "message": "Start date must be on or before end date."}
+        date_range_error = _validate_backtest_date_range(start_date, end_date)
+        if date_range_error:
+            return {"status": "error", "message": date_range_error}
         if req.data_source != "ccxt":
             source_interval = YFINANCE_INTERVALS[req.timeframe]
             max_history_days = {"1m": 7, "5m": 60, "15m": 60, "30m": 60, "60m": 730}.get(
